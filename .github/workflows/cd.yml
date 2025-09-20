@@ -33,11 +33,13 @@ jobs:
       id-token: write
 
     steps:
-      - name: Download artifact from CI
+      - name: Download artifact from CI (from triggering CI run)
         uses: actions/download-artifact@v4
         with:
           name: deploy-manifest
           path: .
+          run-id: ${{ github.event.workflow_run.id }}   
+          github-token: ${{ secrets.GITHUB_TOKEN }}   
 
       - name: Read deploy manifest
         id: manifest

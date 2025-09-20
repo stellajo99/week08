@@ -2,9 +2,9 @@ name: CI - Build & Test
 
 on:
   pull_request:
-    branches: [ "main" ]        # PR → main
+    branches: [ "main" ]     
   push:
-    branches: [ "development" ] 
+    branches: [ "development" ]
 
 env:
   REGISTRY: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
@@ -25,7 +25,6 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # Login to Azure Container Registry (ACR)
       - name: Login to ACR
         run: az acr login --name ${{ secrets.AZURE_CONTAINER_REGISTRY }}
 
@@ -33,19 +32,35 @@ jobs:
         id: meta
         run: echo "TAG=sha-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
+      - name: Show workspace tree (debug)
+        run: |
+          echo "::group::tree"
+          pwd
+          ls -la
+          echo "---- week08/"
+          ls -la week08
+          echo "---- week08/backend/"
+          ls -la week08/backend
+          echo "---- week08/frontend/"
+          ls -la week08/frontend
+          echo "::endgroup::"
+
       - name: Build & Push product-service
         run: |
-          docker build -t $REGISTRY/product-service:${{ steps.meta.outputs.TAG }} -f week08/product_service/Dockerfile week08/product_service
+          docker build -t $REGISTRY/product-service:${{ steps.meta.outputs.TAG }} \
+            -f week08/backend/product_service/Dockerfile week08/backend/product_service
           docker push $REGISTRY/product-service:${{ steps.meta.outputs.TAG }}
 
       - name: Build & Push order-service
         run: |
-          docker build -t $REGISTRY/order-service:${{ steps.meta.outputs.TAG }} -f week08/order_service/Dockerfile week08/order_service
+          docker build -t $REGISTRY/order-service:${{ steps.meta.outputs.TAG }} \
+            -f week08/backend/order_service/Dockerfile week08/backend/order_service
           docker push $REGISTRY/order-service:${{ steps.meta.outputs.TAG }}
 
       - name: Build & Push frontend
         run: |
-          docker build -t $REGISTRY/frontend:${{ steps.meta.outputs.TAG }} -f week08/frontend/Dockerfile week08/frontend
+          docker build -t $REGISTRY/frontend:${{ steps.meta.outputs.TAG }} \
+            -f week08/frontend/Dockerfile week08/frontend
           docker push $REGISTRY/frontend:${{ steps.meta.outputs.TAG }}
 
       - name: Publish deploy manifest (artifact)

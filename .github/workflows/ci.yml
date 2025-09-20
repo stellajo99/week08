@@ -35,12 +35,12 @@ jobs:
 
       - name: Build & Push product-service
         run: |
-          docker build -t $REGISTRY/product-service:${{ steps.meta.outputs.TAG }} -f week08/product-service/Dockerfile week08/product-service
+          docker build -t $REGISTRY/product-service:${{ steps.meta.outputs.TAG }} -f week08/product_service/Dockerfile week08/product_service
           docker push $REGISTRY/product-service:${{ steps.meta.outputs.TAG }}
 
       - name: Build & Push order-service
         run: |
-          docker build -t $REGISTRY/order-service:${{ steps.meta.outputs.TAG }} -f week08/order-service/Dockerfile week08/order-service
+          docker build -t $REGISTRY/order-service:${{ steps.meta.outputs.TAG }} -f week08/order_service/Dockerfile week08/order_service
           docker push $REGISTRY/order-service:${{ steps.meta.outputs.TAG }}
 
       - name: Build & Push frontend

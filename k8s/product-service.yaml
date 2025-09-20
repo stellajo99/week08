@@ -19,7 +19,6 @@ spec:
       containers:
       - name: product-service-container
         image: deakinstellaregistry.azurecr.io/product_service:latest
-        imagePullPolicy: Always
         ports:
         - containerPort: 8000
         env:

@@ -1,0 +1,111 @@
+name: CD - Deploy to AKS
+
+on:
+  workflow_run:
+    workflows: [ "CI - Build & Test" ]
+    types: [ "completed" ]
+  workflow_dispatch:
+    inputs:
+      aks_resource_group:
+        description: "AKS Resource Group"
+        required: true
+        default: "deakinuni"
+      aks_cluster_name:
+        description: "AKS Cluster Name"
+        required: true
+        default: "deakinstellak8s"
+      namespace:
+        description: "K8s Namespace"
+        required: true
+        default: "default"
+
+env:
+  REGISTRY: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+
+jobs:
+  deploy:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download artifact from CI
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy-manifest
+          path: .
+
+      - name: Read deploy manifest
+        id: manifest
+        run: |
+          echo "TAG=$(jq -r .tag deploy-manifest.json)" >> $GITHUB_OUTPUT
+          echo "REGISTRY=$(jq -r .registry deploy-manifest.json)" >> $GITHUB_OUTPUT
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS context
+        run: |
+          az aks get-credentials -g "${{ github.event.inputs.aks_resource_group || 'deakinuni' }}" \
+                                 -n "${{ github.event.inputs.aks_cluster_name   || 'deakinstellak8s' }}" \
+                                 --overwrite-existing
+
+      - name: Ensure namespace exists
+        run: |
+          NS="${{ github.event.inputs.namespace || 'default' }}"
+          kubectl get ns "$NS" || kubectl create ns "$NS"
+
+      - name: Apply Deployments & Services
+        env:
+          NS: ${{ github.event.inputs.namespace || 'default' }}
+          ACR_LOGIN_SERVER: ${{ steps.manifest.outputs.REGISTRY }}
+          IMAGE_TAG: ${{ steps.manifest.outputs.TAG }}
+        run: |
+          export ACR_LOGIN_SERVER=$ACR_LOGIN_SERVER
+          export IMAGE_TAG=$IMAGE_TAG
+
+          envsubst < week08/k8s/product-service.yaml | kubectl apply -n $NS -f -
+          envsubst < week08/k8s/order-service.yaml   | kubectl apply -n $NS -f -
+          envsubst < week08/k8s/frontend.yaml        | kubectl apply -n $NS -f -
+
+      - name: Wait for External IPs (product/order)
+        env:
+          NS: ${{ github.event.inputs.namespace || 'default' }}
+        run: |
+          set -e
+          for i in {1..30}; do
+            PRODUCT_IP=$(kubectl get svc product-service-w08e1 -n $NS -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            [ -n "$PRODUCT_IP" ] && break || sleep 10
+          done
+          echo "PRODUCT_IP=$PRODUCT_IP" >> $GITHUB_ENV
+
+          for i in {1..30}; do
+            ORDER_IP=$(kubectl get svc order-service-w08e1 -n $NS -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            [ -n "$ORDER_IP" ] && break || sleep 10
+          done
+          echo "ORDER_IP=$ORDER_IP" >> $GITHUB_ENV
+
+      - name: Create/Update frontend runtime config (config.js via ConfigMap)
+        env:
+          NS: ${{ github.event.inputs.namespace || 'default' }}
+        run: |
+          echo "window.__CONFIG__ = { PRODUCT_API_URL: 'http://${PRODUCT_IP}:8000', ORDER_API_URL: 'http://${ORDER_IP}:8001' };" > config.js
+          kubectl -n $NS create configmap frontend-config --from-file=config.js --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n $NS rollout restart deploy/frontend
+
+      - name: Show Endpoints
+        env:
+          NS: ${{ github.event.inputs.namespace || 'default' }}
+        run: |
+          echo "Frontend EXTERNAL-IP: $(kubectl get svc frontend-w08e1 -n $NS -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+          echo "Product  EXTERNAL-IP: ${PRODUCT_IP}"
+          echo "Order    EXTERNAL-IP: ${ORDER_IP}"

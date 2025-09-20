@@ -1,0 +1,129 @@
+name: CD - Deploy to AKS
+
+on:
+  workflow_run:
+    workflows: [ "CI - Build & Test" ]
+    types: [ "completed" ]
+  workflow_dispatch:
+    inputs:
+      aks_resource_group:
+        description: "AKS Resource Group"
+        required: true
+        default: "deakinuni"
+      aks_cluster_name:
+        description: "AKS Cluster Name"
+        required: true
+        default: "deakinstellak8s"
+      namespace:
+        description: "K8s Namespace"
+        required: true
+        default: "default"
+
+env:
+  REGISTRY: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+
+jobs:
+  deploy:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download artifact from CI
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy-manifest
+          path: .
+
+      - name: Read deploy manifest
+        id: manifest
+        run: |
+          echo "TAG=$(jq -r .tag deploy-manifest.json)"       >> "$GITHUB_OUTPUT"
+          echo "REGISTRY=$(jq -r .registry deploy-manifest.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS context
+        run: |
+          az aks get-credentials \
+            -g "${{ github.event.inputs.aks_resource_group || 'deakinuni' }}" \
+            -n "${{ github.event.inputs.aks_cluster_name   || 'deakinstellak8s' }}" \
+            --overwrite-existing
+
+      - name: Ensure namespace exists
+        run: |
+          NS="${{ github.event.inputs.namespace || 'default' }}"
+          kubectl get ns "$NS" || kubectl create ns "$NS"
+
+      - name: Apply Kubernetes manifests (no placeholders required)
+        env:
+          NS: ${{ github.event.inputs.namespace || 'default' }}
+        run: |
+          kubectl apply -n "$NS" -f k8s/configmaps.yaml || true
+          kubectl apply -n "$NS" -f k8s/secrets.yaml    || true
+          kubectl apply -n "$NS" -f k8s/product-service.yaml
+          kubectl apply -n "$NS" -f k8s/order-service.yaml
+          kubectl apply -n "$NS" -f k8s/frontend.yaml
+
+      - name: Set images to the freshly built tags
+        env:
+          NS: ${{ github.event.inputs.namespace || 'default' }}
+          REG: ${{ steps.manifest.outputs.REGISTRY }}
+          TAG: ${{ steps.manifest.outputs.TAG }}
+        run: |
+          kubectl -n "$NS" set image deploy/product-service-w08e1 product-service-container="$REG/product-service:$TAG"
+          kubectl -n "$NS" set image deploy/order-service-w08e1   order-service-container="$REG/order-service:$TAG"
+          kubectl -n "$NS" set image deploy/frontend              frontend="$REG/frontend:$TAG"
+
+      - name: Wait for rollouts
+        env:
+          NS: ${{ github.event.inputs.namespace || 'default' }}
+        run: |
+          kubectl -n "$NS" rollout status deploy/product-service-w08e1
+          kubectl -n "$NS" rollout status deploy/order-service-w08e1
+          kubectl -n "$NS" rollout status deploy/frontend
+
+      - name: Wait for External IPs (product/order/frontend)
+        id: ips
+        env:
+          NS: ${{ github.event.inputs.namespace || 'default' }}
+        run: |
+          set -e
+          for i in {1..30}; do
+            P=$(kubectl get svc product-service-w08e1 -n "$NS" -o jsonpath='{.status.loadBalancer.ingress[0].ip}') && [ -n "$P" ] && break || sleep 10
+          done
+          for i in {1..30}; do
+            O=$(kubectl get svc order-service-w08e1   -n "$NS" -o jsonpath='{.status.loadBalancer.ingress[0].ip}') && [ -n "$O" ] && break || sleep 10
+          done
+          for i in {1..30}; do
+            F=$(kubectl get svc frontend-w08e1        -n "$NS" -o jsonpath='{.status.loadBalancer.ingress[0].ip}') && [ -n "$F" ] && break || sleep 10
+          done
+          echo "PRODUCT_IP=$P" >> "$GITHUB_OUTPUT"
+          echo "ORDER_IP=$O"   >> "$GITHUB_OUTPUT"
+          echo "FRONT_IP=$F"   >> "$GITHUB_OUTPUT"
+
+      - name: Create/Update frontend runtime config (config.js via ConfigMap)
+        env:
+          NS: ${{ github.event.inputs.namespace || 'default' }}
+        run: |
+          echo "window.__CONFIG__ = { PRODUCT_API_URL: 'http://${{ steps.ips.outputs.PRODUCT_IP }}:8000', ORDER_API_URL: 'http://${{ steps.ips.outputs.ORDER_IP }}:8001' };" > config.js
+          kubectl -n "$NS" create configmap frontend-config --from-file=config.js --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n "$NS" rollout restart deploy/frontend
+
+      - name: Show endpoints
+        env:
+          NS: ${{ github.event.inputs.namespace || 'default' }}
+        run: |
+          echo "Frontend EXTERNAL-IP: ${{ steps.ips.outputs.FRONT_IP }}"
+          echo "Product  EXTERNAL-IP: ${{ steps.ips.outputs.PRODUCT_IP }}"
+          echo "Order    EXTERNAL-IP: ${{ steps.ips.outputs.ORDER_IP }}"

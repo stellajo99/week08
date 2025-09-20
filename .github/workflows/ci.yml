@@ -1,0 +1,82 @@
+name: CI - Build & Test
+
+on:
+  pull_request:
+    branches: [ "main" ]       
+  push:
+    branches: [ "development" ] 
+
+env:
+  REGISTRY: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+
+jobs:
+  test-build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (Service Principal)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR
+        run: |
+          ACR_NAME="$(echo "${{ secrets.AZURE_CONTAINER_REGISTRY }}" | cut -d'.' -f1)"
+          az acr login --name "$ACR_NAME"
+
+      - name: Set image tag
+        id: meta
+        run: echo "TAG=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Show workspace tree (debug)
+        run: |
+          echo "::group::tree"
+          pwd
+          ls -la
+          echo "---- backend/"
+          ls -la backend
+          echo "---- frontend/"
+          ls -la frontend
+          echo "---- k8s/"
+          ls -la k8s
+          echo "::endgroup::"
+
+      - name: Build & Push product-service
+        run: |
+          docker build -t $REGISTRY/product-service:${{ steps.meta.outputs.TAG }} \
+            -f backend/product_service/Dockerfile backend/product_service
+          docker push $REGISTRY/product-service:${{ steps.meta.outputs.TAG }}
+
+      - name: Build & Push order-service
+        run: |
+          docker build -t $REGISTRY/order-service:${{ steps.meta.outputs.TAG }} \
+            -f backend/order_service/Dockerfile backend/order_service
+          docker push $REGISTRY/order-service:${{ steps.meta.outputs.TAG }}
+
+      - name: Build & Push frontend
+        run: |
+          docker build -t $REGISTRY/frontend:${{ steps.meta.outputs.TAG }} \
+            -f frontend/Dockerfile frontend
+          docker push $REGISTRY/frontend:${{ steps.meta.outputs.TAG }}
+
+      - name: Publish deploy manifest (artifact)
+        run: |
+          mkdir -p out
+          cat > out/deploy-manifest.json <<EOF
+          {
+            "tag": "${{ steps.meta.outputs.TAG }}",
+            "registry": "${{ env.REGISTRY }}"
+          }
+          EOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-manifest
+          path: out/deploy-manifest.json

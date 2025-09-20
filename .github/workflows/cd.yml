@@ -219,6 +219,27 @@ jobs:
           
           echo "✅ Manifests applied successfully"
 
+      # --- Create Default Frontend Config ---
+      - name: Create default frontend config
+        env:
+          NS: ${{ github.event.inputs.namespace || 'default' }}
+        run: |
+          echo "⚙️ Creating default frontend configuration..."
+          
+          # Create default config to allow frontend to start
+          cat > default-config.js << EOF
+          window.__CONFIG__ = {
+            PRODUCT_API_URL: 'http://loading:8000',
+            ORDER_API_URL: 'http://loading:8001',
+            STATUS: 'loading'
+          };
+          EOF
+          
+          # Create or update the ConfigMap
+          kubectl -n "$NS" create configmap frontend-config --from-file=config.js=default-config.js --dry-run=client -o yaml | kubectl apply -f -
+          
+          echo "✅ Default frontend config created"
+
       # --- Image Updates ---
       - name: Update deployment images
         env:
@@ -288,28 +309,31 @@ jobs:
             done
           done
 
-      - name: Configure frontend runtime
+      - name: Update frontend runtime configuration
         env:
           NS: ${{ github.event.inputs.namespace || 'default' }}
         run: |
-          echo "⚙️  Configuring frontend runtime..."
+          echo "🔄 Updating frontend runtime configuration..."
           
-          # Create runtime configuration
-          cat > config.js << EOF
+          # Create final runtime configuration with actual IPs
+          cat > final-config.js << EOF
           window.__CONFIG__ = {
             PRODUCT_API_URL: 'http://${{ steps.services.outputs.PRODUCT_IP }}:8000',
             ORDER_API_URL: 'http://${{ steps.services.outputs.ORDER_IP }}:8001',
             VERSION: '${{ steps.manifest.outputs.TAG }}',
-            DEPLOYED_AT: '$(date -u +%Y-%m-%dT%H:%M:%SZ)'
+            DEPLOYED_AT: '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+            STATUS: 'ready'
           };
           EOF
           
-          # Update ConfigMap and restart frontend
-          kubectl -n "$NS" create configmap frontend-config --from-file=config.js --dry-run=client -o yaml | kubectl apply -f -
+          # Update ConfigMap with final configuration
+          kubectl -n "$NS" create configmap frontend-config --from-file=config.js=final-config.js --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Restart frontend to pick up new config
           kubectl -n "$NS" rollout restart deploy/frontend
           kubectl -n "$NS" rollout status deploy/frontend --timeout=300s
           
-          echo "✅ Frontend configuration updated"
+          echo "✅ Frontend configuration updated with actual service IPs"
 
       # --- Deployment Summary ---
       - name: Deployment summary

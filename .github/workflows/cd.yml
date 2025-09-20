@@ -5,6 +5,7 @@ on:
   workflow_run:
     workflows: ["CI - Build & Test"]
     types: [completed]
+    branches: [main]
 
   # Optional: manual deploy from Actions UI
   workflow_dispatch:

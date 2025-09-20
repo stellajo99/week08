@@ -22,19 +22,25 @@ on:
         required: true
         default: "default"
 
+# Prevent overlapping duplicate runs (keeps only the latest)
+concurrency:
+  group: cd-main
+  cancel-in-progress: true
+
 env:
   # Only two secrets are used: AZURE_CREDENTIALS and AZURE_CONTAINER_REGISTRY
   REGISTRY: "${{ secrets.AZURE_CONTAINER_REGISTRY }}"
 
 jobs:
   deploy:
-    # Auto: run only if the triggering CI succeeded *and* branch is main
+    # Auto: run only if the triggering CI succeeded, branch is main, AND the CI was for a PUSH event
     # Manual: always allowed
     if: >
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'workflow_run' &&
        github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'main')
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.event == 'push')
 
     runs-on: ubuntu-latest
     permissions:
@@ -95,10 +101,10 @@ jobs:
         id: manifest
         run: |
           if [ "${{ github.event_name }}" = "workflow_run" ]; then
-            echo "TAG=${{ steps.manifest_auto.outputs.TAG }}"           >> "$GITHUB_OUTPUT"
-            echo "REGISTRY=${{ steps.manifest_auto.outputs.REGISTRY }}" >> "$GITHUB_OUTPUT"
+            echo "TAG=${{ steps.manifest_auto.outputs.TAG }}"             >> "$GITHUB_OUTPUT"
+            echo "REGISTRY=${{ steps.manifest_auto.outputs.REGISTRY }}"   >> "$GITHUB_OUTPUT"
           else
-            echo "TAG=${{ steps.manifest_manual.outputs.TAG }}"         >> "$GITHUB_OUTPUT"
+            echo "TAG=${{ steps.manifest_manual.outputs.TAG }}"           >> "$GITHUB_OUTPUT"
             echo "REGISTRY=${{ steps.manifest_manual.outputs.REGISTRY }}" >> "$GITHUB_OUTPUT"
           fi
 

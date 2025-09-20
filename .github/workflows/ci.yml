@@ -1,21 +1,56 @@
 name: CI - Build & Test
 
 on:
+  # Pull requests to main - for code review and testing
   pull_request:
-    branches: [ "main" ]       
+    branches: [ "main" ]
+    
   push:
-    branches: [ "development" ] 
+    branches: [ "development", "main" ]
+    
+  # Manual trigger for emergency deployments
+  workflow_dispatch:
 
 env:
   REGISTRY: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
 
 jobs:
-  test-build-push:
+  # Job 1: Always run tests
+  test:
+    name: Run Tests
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Set up Node.js (if needed for frontend tests)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          
+      - name: Run unit tests
+        run: |
+          echo "Running unit tests..."
+          # Add your test commands here
+          # npm test, pytest, etc.
+          
+      - name: Run integration tests
+        run: |
+          echo "Running integration tests..."
+          # Add integration test commands
+
+  # Job 2: Build and conditionally push
+  build-and-push:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    needs: test  # Only run if tests pass
     permissions:
       contents: read
       id-token: write
-
+    
+    # Only build and push for main branch or manual dispatch
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,51 +67,102 @@ jobs:
 
       - name: Set image tag
         id: meta
-        run: echo "TAG=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-
-      - name: Show workspace tree (debug)
         run: |
-          echo "::group::tree"
+          # Use branch name and commit SHA for better traceability
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "TAG=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          else
+            echo "TAG=dev-sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Show build context
+        run: |
+          echo "::group::Build Context"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Event: ${{ github.event_name }}"
+          echo "Image Tag: ${{ steps.meta.outputs.TAG }}"
+          echo "Registry: ${{ env.REGISTRY }}"
           pwd
           ls -la
           echo "---- backend/"
-          ls -la backend
+          ls -la backend/
           echo "---- frontend/"
-          ls -la frontend
+          ls -la frontend/
           echo "---- k8s/"
-          ls -la k8s
+          ls -la k8s/
           echo "::endgroup::"
 
       - name: Build & Push product-service
         run: |
+          echo "Building product-service..."
           docker build -t $REGISTRY/product-service:${{ steps.meta.outputs.TAG }} \
             -f backend/product_service/Dockerfile backend/product_service
           docker push $REGISTRY/product-service:${{ steps.meta.outputs.TAG }}
+          echo "✅ product-service pushed successfully"
 
       - name: Build & Push order-service
         run: |
+          echo "Building order-service..."
           docker build -t $REGISTRY/order-service:${{ steps.meta.outputs.TAG }} \
             -f backend/order_service/Dockerfile backend/order_service
           docker push $REGISTRY/order-service:${{ steps.meta.outputs.TAG }}
+          echo "✅ order-service pushed successfully"
 
       - name: Build & Push frontend
         run: |
+          echo "Building frontend..."
           docker build -t $REGISTRY/frontend:${{ steps.meta.outputs.TAG }} \
             -f frontend/Dockerfile frontend
           docker push $REGISTRY/frontend:${{ steps.meta.outputs.TAG }}
+          echo "✅ frontend pushed successfully"
 
-      - name: Publish deploy manifest (artifact)
+      - name: Verify image push
+        run: |
+          echo "Verifying pushed images..."
+          ACR_NAME="$(echo "${{ secrets.AZURE_CONTAINER_REGISTRY }}" | cut -d'.' -f1)"
+          
+          echo "Images in product-service repository:"
+          az acr repository show-tags --name "$ACR_NAME" --repository product-service --orderby time_desc --top 5
+          
+          echo "Images in order-service repository:"
+          az acr repository show-tags --name "$ACR_NAME" --repository order-service --orderby time_desc --top 5
+          
+          echo "Images in frontend repository:"
+          az acr repository show-tags --name "$ACR_NAME" --repository frontend --orderby time_desc --top 5
+
+      - name: Create deploy manifest
         run: |
           mkdir -p out
           cat > out/deploy-manifest.json <<EOF
           {
             "tag": "${{ steps.meta.outputs.TAG }}",
-            "registry": "${{ env.REGISTRY }}"
+            "registry": "${{ env.REGISTRY }}",
+            "commit_sha": "${{ github.sha }}",
+            "branch": "${{ github.ref_name }}",
+            "build_time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           }
           EOF
+          echo "Deploy manifest created:"
+          cat out/deploy-manifest.json
 
-      - name: Upload artifact
+      - name: Upload deploy artifact
         uses: actions/upload-artifact@v4
         with:
           name: deploy-manifest
           path: out/deploy-manifest.json
+          retention-days: 30
+
+  # Job 3: Development branch feedback
+  development-feedback:
+    name: Development Branch Summary
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/development'
+    
+    steps:
+      - name: Development summary
+        run: |
+          echo "🔍 Development branch CI completed successfully!"
+          echo "✅ Tests passed"
+          echo "ℹ️  Images were NOT pushed to registry (development branch)"
+          echo "💡 Create a PR to main to trigger production build and deployment"

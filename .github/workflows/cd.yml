@@ -1,9 +1,13 @@
 name: CD - Deploy to AKS
 
 on:
+  # Auto-deploy only when CI for a PUSH to main finishes successfully
   workflow_run:
-    workflows: [ "CI - Build & Test" ]
-    types: [ "completed" ]
+    workflows: ["CI - Build & Test"]
+    types: [completed]
+    branches: [main]
+
+  # Optional: manual deploy from Actions UI
   workflow_dispatch:
     inputs:
       aks_resource_group:
@@ -15,42 +19,49 @@ on:
         required: true
         default: "deakinstellak8s"
       namespace:
-        description: "K8s Namespace"
+        description: "Kubernetes Namespace"
         required: true
         default: "default"
 
+# Prevent overlapping duplicate runs
+concurrency:
+  group: cd-main
+  cancel-in-progress: true
+
 env:
-  REGISTRY: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+  # Only two secrets are used: AZURE_CREDENTIALS and AZURE_CONTAINER_REGISTRY
+  REGISTRY: "${{ secrets.AZURE_CONTAINER_REGISTRY }}"
 
 jobs:
   deploy:
-    if: |
+    # Auto: run only if the triggering CI succeeded, branch is main, AND the CI was for a PUSH event
+    # Manual: always allowed
+    if: >
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.event == 'push')
+
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
 
     steps:
-      - name: Download artifact from CI (from triggering CI run)
-        uses: actions/download-artifact@v4
-        with:
-          name: deploy-manifest
-          path: .
-          run-id: ${{ github.event.workflow_run.id }}   
-          github-token: ${{ secrets.GITHUB_TOKEN }}   
-
-      - name: Read deploy manifest
-        id: manifest
+      # --- Quick visibility of trigger context
+      - name: Debug trigger (workflow_run context)
+        if: ${{ github.event_name == 'workflow_run' }}
         run: |
-          echo "TAG=$(jq -r .tag deploy-manifest.json)"       >> "$GITHUB_OUTPUT"
-          echo "REGISTRY=$(jq -r .registry deploy-manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "workflow_run.event       = ${{ github.event.workflow_run.event }}"
+          echo "workflow_run.head_branch = ${{ github.event.workflow_run.head_branch }}"
+          echo "workflow_run.id          = ${{ github.event.workflow_run.id }}"
 
-      - name: Checkout
+      # --- Auth & cluster context ------------------------------------------------
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Azure Login
+      - name: Azure Login (Service Principal)
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
@@ -67,7 +78,50 @@ jobs:
           NS="${{ github.event.inputs.namespace || 'default' }}"
           kubectl get ns "$NS" || kubectl create ns "$NS"
 
-      - name: Apply Kubernetes manifests (no placeholders required)
+      # --- Pull image metadata (TAG/REGISTRY) -----------------------------------
+      # Auto mode: download the artifact from the *triggering CI run*
+      - name: Download artifact from triggering CI
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy-manifest
+          path: .
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read deploy manifest (auto)
+        id: manifest_auto
+        if: ${{ github.event_name == 'workflow_run' }}
+        run: |
+          cat deploy-manifest.json
+          echo "TAG=$(jq -r .tag deploy-manifest.json)"           >> "$GITHUB_OUTPUT"
+          echo "REGISTRY=$(jq -r .registry deploy-manifest.json)" >> "$GITHUB_OUTPUT"
+
+      # Manual mode: use current commit’s short SHA as the image tag
+      # (Use only if the same commit was built & pushed by CI)
+      - name: Set manifest from current commit (manual)
+        id: manifest_manual
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          echo "TAG=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "REGISTRY=${REGISTRY}"     >> "$GITHUB_OUTPUT"
+
+      # Normalize outputs so following steps can read steps.manifest.outputs.*
+      - name: Select manifest outputs
+        id: manifest
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "TAG=${{ steps.manifest_auto.outputs.TAG }}"             >> "$GITHUB_OUTPUT"
+            echo "REGISTRY=${{ steps.manifest_auto.outputs.REGISTRY }}"   >> "$GITHUB_OUTPUT"
+          else
+            echo "TAG=${{ steps.manifest_manual.outputs.TAG }}"           >> "$GITHUB_OUTPUT"
+            echo "REGISTRY=${{ steps.manifest_manual.outputs.REGISTRY }}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Using image tag: ${{ steps.manifest.outputs.TAG }}"
+          echo "Using registry : ${{ steps.manifest.outputs.REGISTRY }}"
+
+      # --- Apply K8s manifests (safe to re-apply) -------------------------------
+      - name: Apply Kubernetes manifests
         env:
           NS: ${{ github.event.inputs.namespace || 'default' }}
         run: |
@@ -77,24 +131,49 @@ jobs:
           kubectl apply -n "$NS" -f k8s/order-service.yaml
           kubectl apply -n "$NS" -f k8s/frontend.yaml
 
-      - name: Set images to the freshly built tags
+      # --- Set images (auto-detect container names to avoid rollout stalls) -----
+      - name: Set images to freshly built tags (auto-detect container names)
         env:
-          NS: ${{ github.event.inputs.namespace || 'default' }}
+          NS:  ${{ github.event.inputs.namespace || 'default' }}
           REG: ${{ steps.manifest.outputs.REGISTRY }}
           TAG: ${{ steps.manifest.outputs.TAG }}
         run: |
-          kubectl -n "$NS" set image deploy/product-service-w08e1 product-service-container="$REG/product-service:$TAG"
-          kubectl -n "$NS" set image deploy/order-service-w08e1   order-service-container="$REG/order-service:$TAG"
-          kubectl -n "$NS" set image deploy/frontend              frontend="$REG/frontend:$TAG"
+          set -e
+          PROD_DEP=product-service-w08e1
+          ORDER_DEP=order-service-w08e1
+          FRONT_DEP=frontend
 
+          PROD_CTN=$(kubectl -n "$NS" get deploy "$PROD_DEP"  -o jsonpath='{.spec.template.spec.containers[0].name}')
+          ORDER_CTN=$(kubectl -n "$NS" get deploy "$ORDER_DEP" -o jsonpath='{.spec.template.spec.containers[0].name}')
+          FRONT_CTN=$(kubectl -n "$NS" get deploy "$FRONT_DEP" -o jsonpath='{.spec.template.spec.containers[0].name}')
+
+          echo "Detected containers:"
+          echo "  $PROD_DEP  -> $PROD_CTN"
+          echo "  $ORDER_DEP -> $ORDER_CTN"
+          echo "  $FRONT_DEP -> $FRONT_CTN"
+
+          kubectl -n "$NS" set image deploy/$PROD_DEP  $PROD_CTN="$REG/product-service:$TAG"
+          kubectl -n "$NS" set image deploy/$ORDER_DEP $ORDER_CTN="$REG/order-service:$TAG"
+          kubectl -n "$NS" set image deploy/$FRONT_DEP $FRONT_CTN="$REG/frontend:$TAG"
+
+      # --- Wait for rollouts (with quick diagnostics on failure) ----------------
       - name: Wait for rollouts
         env:
           NS: ${{ github.event.inputs.namespace || 'default' }}
         run: |
-          kubectl -n "$NS" rollout status deploy/product-service-w08e1
-          kubectl -n "$NS" rollout status deploy/order-service-w08e1
-          kubectl -n "$NS" rollout status deploy/frontend
+          set -e
+          for DEP in product-service-w08e1 order-service-w08e1 frontend; do
+            echo "Waiting for rollout: $DEP"
+            if ! kubectl -n "$NS" rollout status "deploy/$DEP" --timeout=300s; then
+              echo "::warning::Rollout failed for $DEP. Showing describe and recent events."
+              kubectl -n "$NS" describe deploy "$DEP" || true
+              kubectl -n "$NS" get rs -l app=$(echo $DEP | sed 's/-w08e1$//') -o wide || true
+              kubectl -n "$NS" get pods -l app=$(echo $DEP | sed 's/-w08e1$//') -o wide || true
+              exit 1
+            fi
+          done
 
+      # --- Discover external IPs & generate frontend runtime config -------------
       - name: Wait for External IPs (product/order/frontend)
         id: ips
         env:
@@ -113,6 +192,7 @@ jobs:
           echo "PRODUCT_IP=$P" >> "$GITHUB_OUTPUT"
           echo "ORDER_IP=$O"   >> "$GITHUB_OUTPUT"
           echo "FRONT_IP=$F"   >> "$GITHUB_OUTPUT"
+          echo "Resolved IPs -> product: $P, order: $O, frontend: $F"
 
       - name: Create/Update frontend runtime config (config.js via ConfigMap)
         env:
@@ -122,9 +202,8 @@ jobs:
           kubectl -n "$NS" create configmap frontend-config --from-file=config.js --dry-run=client -o yaml | kubectl apply -f -
           kubectl -n "$NS" rollout restart deploy/frontend
 
+      # --- Output endpoints for verification -----------------------------------
       - name: Show endpoints
-        env:
-          NS: ${{ github.event.inputs.namespace || 'default' }}
         run: |
           echo "Frontend EXTERNAL-IP: ${{ steps.ips.outputs.FRONT_IP }}"
           echo "Product  EXTERNAL-IP: ${{ steps.ips.outputs.PRODUCT_IP }}"

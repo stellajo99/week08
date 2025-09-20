@@ -10,3 +10,6 @@ data:
   ORDERS_DB_NAME: orders
   AZURE_STORAGE_CONTAINER_NAME: product-images
   AZURE_SAS_TOKEN_EXPIRY_HOURS: "24"
+
+  PRODUCT_SERVICE_URL: "http://product-service-w08e1:8000"
+  ORDER_SERVICE_URL: "http://order-service-w08e1:8001"

@@ -6,15 +6,6 @@ on:
   push:
     branches: [ "development" ] 
 
-concurrency:
-  group: >
-    ci-${
-      { github.event_name == 'pull_request'
-          && format('pr-{0}', github.event.pull_request.number) }
-      || { github.event_name == 'push' && github.ref }
-    }
-  cancel-in-progress: true
-
 env:
   REGISTRY: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
 

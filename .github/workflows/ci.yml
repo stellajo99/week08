@@ -5,13 +5,8 @@ on:
   pull_request:
     branches: [ "main" ]
     
-  # Push to development - for development testing
   push:
-    branches: [ "development" ]
-    
-  # Push to main - for production deployment trigger
-  push:
-    branches: [ "main" ]
+    branches: [ "development", "main" ]
     
   # Manual trigger for emergency deployments
   workflow_dispatch:

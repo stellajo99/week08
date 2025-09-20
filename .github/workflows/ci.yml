@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [ "main" ]       
   push:
-    branches: [ "development" ] 
+    branches: [ "development, "main" ] 
 
 env:
   REGISTRY: ${{ secrets.AZURE_CONTAINER_REGISTRY }}

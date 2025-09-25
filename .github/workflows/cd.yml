@@ -1,5 +1,5 @@
 name: CD - Deploy to AKS
-# small change
+
 on:
   # Auto-deploy only when CI for a PUSH to main finishes successfully
   workflow_run:
